@@ -1,9 +1,7 @@
-# System 1818 — News & Earnings Bot dependencies
-# Add to your existing requirements.txt (these supplement your current stack)
-
-anthropic>=0.28.0
-feedparser>=6.0.11
-beautifulsoup4>=4.12.0
-requests>=2.31.0
-pandas>=2.2.0
-yfinance>=0.2.40
+streamlit
+anthropic
+feedparser
+beautifulsoup4
+requests
+pandas
+yfinance
