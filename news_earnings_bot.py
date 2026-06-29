@@ -1,907 +1,928 @@
 """
-System 1818 — News & Earnings Intelligence Bot
-Scans news, classifies against 20-year Nifty playbook, reads quarterly filings,
-and generates market impact signals.
+System 1818 News — Standalone Market Intelligence App
+100% independent. No other System 1818 files needed.
+Deploy the folder containing this file directly to Streamlit Cloud.
 
-Usage:
-    bot = NewsEarningsBot()
-    signals = bot.run_full_scan()
+Folder structure required:
+  system1818news/
+  ├── app.py           ← this file
+  ├── requirements.txt
+  └── .streamlit/
+      └── secrets.toml  (local only — never commit)
 """
 
-import os
-import json
-import time
-import hashlib
-import logging
-import requests
-import feedparser
-import anthropic
+import os, json, time, hashlib, logging
+import requests, feedparser, anthropic
 import pandas as pd
-from datetime import datetime, timedelta, date
+import streamlit as st
+from datetime import datetime, date
 from typing import Optional
-from dataclasses import dataclass, asdict
 from bs4 import BeautifulSoup
 
-logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
+# ── PAGE CONFIG — must be the very first Streamlit call ──────────
+st.set_page_config(
+    page_title="System 1818 News",
+    page_icon="📰",
+    layout="wide",
+    initial_sidebar_state="expanded",
+)
+
+logging.basicConfig(level=logging.INFO)
 log = logging.getLogger(__name__)
 
-# ─────────────────────────────────────────────
-# CONFIG
-# ─────────────────────────────────────────────
+# ─────────────────────────────────────────────────────────────────
+# SECRETS
+# ─────────────────────────────────────────────────────────────────
 
-ANTHROPIC_API_KEY = os.getenv("ANTHROPIC_API_KEY", "")
-CACHE_DIR = "bot_cache"
+def get_api_key() -> str:
+    try:
+        return st.secrets["ANTHROPIC_API_KEY"]
+    except Exception:
+        return os.getenv("ANTHROPIC_API_KEY", "")
+
+# ─────────────────────────────────────────────────────────────────
+# CACHE  (uses /tmp — works on Streamlit Cloud)
+# ─────────────────────────────────────────────────────────────────
+
+CACHE_DIR = "/tmp/s1818news"
 os.makedirs(CACHE_DIR, exist_ok=True)
 
-# F&O stocks to track (NSE symbols → BSE security codes for filings)
-FNO_STOCKS = {
-    "HDFCBANK":  ("532275", "HDFC Bank"),
-    "RELIANCE":  ("500325", "Reliance Industries"),
-    "TCS":       ("532540", "Tata Consultancy Services"),
-    "INFY":      ("500209", "Infosys"),
-    "ICICIBANK": ("532174", "ICICI Bank"),
-    "AXISBANK":  ("532215", "Axis Bank"),
-    "SBIN":      ("500112", "State Bank of India"),
-    "KOTAKBANK": ("500247", "Kotak Mahindra Bank"),
-    "LT":        ("500510", "Larsen & Toubro"),
-    "WIPRO":     ("507685", "Wipro"),
-    "BAJFINANCE":("500034", "Bajaj Finance"),
-    "MARUTI":    ("532500", "Maruti Suzuki"),
-    "TATASTEEL": ("500470", "Tata Steel"),
-    "NTPC":      ("532555", "NTPC"),
-    "POWERGRID": ("532898", "Power Grid"),
-    "ADANIENT":  ("512599", "Adani Enterprises"),
-    "ONGC":      ("500312", "ONGC"),
-    "HINDUNILVR":("500696", "Hindustan Unilever"),
-    "ITC":       ("500875", "ITC"),
-    "SUNPHARMA": ("524715", "Sun Pharmaceuticals"),
-}
-
-# News RSS feeds — all freely accessible
-NEWS_FEEDS = [
-    ("ET Markets",       "https://economictimes.indiatimes.com/markets/rssfeeds/1977021501.cms"),
-    ("ET Economy",       "https://economictimes.indiatimes.com/economy/rssfeeds/1373380680.cms"),
-    ("Moneycontrol",     "https://www.moneycontrol.com/rss/marketsindia.xml"),
-    ("BSE Corporate",    "https://www.bseindia.com/xml-data/corpfiling/AttachLive/"),  # scrape fallback
-    ("LiveMint Markets", "https://www.livemint.com/rss/markets"),
-    ("Reuters India",    "https://feeds.reuters.com/reuters/INbusinessNews"),
-    ("NDTV Profit",      "https://feeds.feedburner.com/ndtvprofit-latest"),
-]
-
-# ─────────────────────────────────────────────
-# PLAYBOOK — 20 year category map
-# ─────────────────────────────────────────────
-
-PLAYBOOK = {
-    "election_surprise": {
-        "label": "Election surprise",
-        "direction": "CRASH", "magnitude": "HIGH",
-        "duration_days": 5, "banknifty_multiplier": 1.2,
-        "keywords": ["exit poll miss", "hung parliament", "unexpected winner", "coalition uncertainty",
-                     "election results", "lok sabha", "vidhan sabha results"],
-    },
-    "election_mandate": {
-        "label": "Election mandate (clear majority)",
-        "direction": "RALLY", "magnitude": "HIGH",
-        "duration_days": 14, "banknifty_multiplier": 1.5,
-        "keywords": ["clear majority", "policy continuity", "stable government", "BJP win",
-                     "NDA majority", "mandate", "pro-reform"],
-    },
-    "global_credit_crisis": {
-        "label": "Global credit / banking crisis",
-        "direction": "CRASH", "magnitude": "EXTREME",
-        "duration_days": 180, "banknifty_multiplier": 2.5,
-        "keywords": ["bank collapse", "credit freeze", "Lehman", "SVB", "systemic risk",
-                     "bank run", "FII outflow record", "circuit breaker global"],
-    },
-    "pandemic_shock": {
-        "label": "Pandemic / health shock",
-        "direction": "CRASH", "magnitude": "EXTREME",
-        "duration_days": 30, "banknifty_multiplier": 2.0,
-        "keywords": ["WHO pandemic", "lockdown", "quarantine", "new virus strain",
-                     "epidemic", "health emergency", "travel ban WHO"],
-    },
-    "domestic_policy_shock": {
-        "label": "Domestic policy shock",
-        "direction": "CRASH", "magnitude": "HIGH",
-        "duration_days": 60, "banknifty_multiplier": 1.0,
-        "keywords": ["demonetisation", "LTCG tax", "STT hike", "sudden policy change",
-                     "GST rate hike", "FII cap", "windfall tax", "export ban"],
-    },
-    "china_contagion": {
-        "label": "China / EM contagion",
-        "direction": "CRASH", "magnitude": "MEDIUM",
-        "duration_days": 14, "banknifty_multiplier": 1.1,
-        "keywords": ["yuan devaluation", "PBOC", "Shanghai crash", "China GDP miss",
-                     "EM selloff", "circuit breaker China", "China slowdown"],
-    },
-    "fed_hawkish": {
-        "label": "US Fed hawkishness",
-        "direction": "CRASH", "magnitude": "MEDIUM",
-        "duration_days": 30, "banknifty_multiplier": 1.2,
-        "keywords": ["Fed rate hike", "taper tantrum", "hawkish FOMC", "US 10Y yield",
-                     "dollar index spike", "DXY", "Powell hawkish", "higher for longer"],
-    },
-    "oil_shock": {
-        "label": "Oil price shock",
-        "direction": "CRASH", "magnitude": "MEDIUM",
-        "duration_days": 21, "banknifty_multiplier": 1.0,
-        "keywords": ["crude above 100", "OPEC cut", "Strait of Hormuz", "oil supply disruption",
-                     "brent spike", "CAD widening", "rupee depreciation oil"],
-    },
-    "domestic_banking_crisis": {
-        "label": "Domestic banking / fraud",
-        "direction": "CRASH", "magnitude": "HIGH",
-        "duration_days": 30, "banknifty_multiplier": 3.0,
-        "keywords": ["bank fraud", "NPA surge", "RBI intervention", "IL&FS", "Yes Bank",
-                     "DHFL default", "NBFC crisis", "short report fraud", "promoter pledge"],
-    },
-    "rbi_rate_cut": {
-        "label": "RBI rate cut / dovish pivot",
-        "direction": "RALLY", "magnitude": "MEDIUM",
-        "duration_days": 14, "banknifty_multiplier": 1.8,
-        "keywords": ["repo rate cut", "CRR cut", "dovish MPC", "RBI cut", "liquidity infusion",
-                     "OMO purchase", "rate cycle reversal", "RBI accommodative"],
-    },
-    "fed_dovish": {
-        "label": "US Fed rate cut / dovish pivot",
-        "direction": "RALLY", "magnitude": "MEDIUM",
-        "duration_days": 14, "banknifty_multiplier": 1.5,
-        "keywords": ["Fed rate cut", "dovish pivot", "QE announcement", "DXY fall",
-                     "EM inflows", "FII buying", "Fed pause", "rate cut expected"],
-    },
-    "growth_budget": {
-        "label": "Growth-oriented Union Budget",
-        "direction": "RALLY", "magnitude": "LOW",
-        "duration_days": 3, "banknifty_multiplier": 1.0,
-        "keywords": ["capex allocation", "infra spending", "fiscal consolidation", "tax relief",
-                     "union budget 2026", "budget announcement", "PLI scheme", "disinvestment"],
-    },
-    "geopolitical": {
-        "label": "Geopolitical shock",
-        "direction": "MIXED", "magnitude": "LOW",
-        "duration_days": 3, "banknifty_multiplier": 1.0,
-        "keywords": ["cross-border attack", "war declaration", "military escalation",
-                     "India Pakistan", "ceasefire", "sanctions", "border tension", "airstrike"],
-    },
-    "heavyweight_earnings": {
-        "label": "Heavyweight stock earnings event",
-        "direction": "MIXED", "magnitude": "LOW",
-        "duration_days": 2, "banknifty_multiplier": 2.0,
-        "keywords": ["HDFC Bank results", "Reliance earnings", "TCS results", "quarterly results",
-                     "earnings miss", "earnings beat", "profit alert", "revenue miss"],
-    },
-    "post_crash_recovery": {
-        "label": "Post-crash V-recovery",
-        "direction": "RALLY", "magnitude": "EXTREME",
-        "duration_days": 365, "banknifty_multiplier": 2.0,
-        "keywords": ["GDP recovery", "earnings upgrade", "risk-on", "FII return",
-                     "cheap valuations", "bargain buying", "economic revival"],
-    },
-    "uncategorised": {
-        "label": "Uncategorised / watch",
-        "direction": "NEUTRAL", "magnitude": "LOW",
-        "duration_days": 1, "banknifty_multiplier": 1.0,
-        "keywords": [],
-    },
-}
-
-# ─────────────────────────────────────────────
-# DATA CLASSES
-# ─────────────────────────────────────────────
-
-@dataclass
-class NewsItem:
-    title: str
-    source: str
-    url: str
-    published: str
-    summary: str = ""
-
-@dataclass
-class NewsSignal:
-    headline: str
-    source: str
-    category: str
-    category_label: str
-    direction: str           # RALLY / CRASH / MIXED / NEUTRAL
-    magnitude: str           # LOW / MEDIUM / HIGH / EXTREME
-    confidence: int          # 0-100
-    nifty_impact: str        # e.g. "-2% to -4%"
-    banknifty_impact: str
-    timing: str              # IMMEDIATE / TOMORROW / 3 DAYS
-    affected_sectors: list
-    reasoning: str
-    timestamp: str
-
-@dataclass
-class EarningsEvent:
-    symbol: str
-    company: str
-    result_date: date
-    days_away: int
-    quarter: str             # e.g. Q4FY26
-    # Comparative data
-    last_year_same_q_summary: str
-    last_quarter_summary: str
-    watch_metrics: list
-    bull_case: str
-    bear_case: str
-    historical_reaction: str  # avg move on result day last 4 quarters
-    nifty_weight_pct: float
-    banknifty_weight_pct: float
-
-# ─────────────────────────────────────────────
-# HELPERS
-# ─────────────────────────────────────────────
-
-def _cache_key(text: str) -> str:
+def _ck(text: str) -> str:
     return hashlib.md5(text.encode()).hexdigest()
 
-def _read_cache(key: str, ttl_minutes: int = 30) -> Optional[dict]:
+def _rcache(key: str, ttl_min: int = 30) -> Optional[dict]:
     path = f"{CACHE_DIR}/{key}.json"
     if not os.path.exists(path):
         return None
-    age = time.time() - os.path.getmtime(path)
-    if age > ttl_minutes * 60:
+    if time.time() - os.path.getmtime(path) > ttl_min * 60:
         return None
-    with open(path) as f:
-        return json.load(f)
+    try:
+        with open(path) as f:
+            return json.load(f)
+    except Exception:
+        return None
 
-def _write_cache(key: str, data: dict):
-    with open(f"{CACHE_DIR}/{key}.json", "w") as f:
-        json.dump(data, f)
+def _wcache(key: str, data):
+    try:
+        with open(f"{CACHE_DIR}/{key}.json", "w") as f:
+            json.dump(data, f, default=str)
+    except Exception:
+        pass
 
-def _claude(system: str, user: str, max_tokens: int = 800) -> str:
-    """Single Claude API call with caching."""
-    ck = _cache_key(system + user)
-    cached = _read_cache(ck, ttl_minutes=60)
+# ─────────────────────────────────────────────────────────────────
+# CLAUDE API HELPER
+# ─────────────────────────────────────────────────────────────────
+
+def _claude(system: str, user: str, max_tokens: int = 800, ttl: int = 60) -> str:
+    ck = _ck(system[:80] + user[:200])
+    cached = _rcache(ck, ttl_min=ttl)
     if cached:
-        return cached["text"]
-    client = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
-    msg = client.messages.create(
-        model="claude-sonnet-4-6",
-        max_tokens=max_tokens,
-        system=system,
-        messages=[{"role": "user", "content": user}],
-    )
-    text = msg.content[0].text
-    _write_cache(ck, {"text": text})
-    return text
+        return cached.get("t", "")
+    key = get_api_key()
+    if not key:
+        return '{"error":"No API key configured"}'
+    try:
+        client = anthropic.Anthropic(api_key=key)
+        msg = client.messages.create(
+            model="claude-sonnet-4-6",
+            max_tokens=max_tokens,
+            system=system,
+            messages=[{"role": "user", "content": user}],
+        )
+        text = msg.content[0].text
+        _wcache(ck, {"t": text})
+        return text
+    except Exception as e:
+        return f'{{"error":"{str(e)}"}}'
 
-# ─────────────────────────────────────────────
-# MODULE 1: NEWS FETCHER
-# ─────────────────────────────────────────────
+def _json(raw: str) -> dict:
+    try:
+        clean = raw.strip().lstrip("```json").lstrip("```").rstrip("```").strip()
+        return json.loads(clean)
+    except Exception:
+        return {}
 
-class NewsFetcher:
-    def fetch_all(self, max_per_feed: int = 20) -> list[NewsItem]:
-        items = []
-        for source_name, url in NEWS_FEEDS:
-            try:
-                feed = feedparser.parse(url)
-                for entry in feed.entries[:max_per_feed]:
-                    items.append(NewsItem(
-                        title=entry.get("title", "").strip(),
-                        source=source_name,
-                        url=entry.get("link", ""),
-                        published=entry.get("published", str(datetime.now())),
-                        summary=BeautifulSoup(
-                            entry.get("summary", ""), "html.parser"
-                        ).get_text()[:500],
-                    ))
-                log.info(f"Fetched {min(len(feed.entries), max_per_feed)} items from {source_name}")
-            except Exception as e:
-                log.warning(f"Feed failed — {source_name}: {e}")
-        # De-duplicate by title hash
-        seen = set()
-        unique = []
-        for item in items:
-            h = _cache_key(item.title[:60])
-            if h not in seen:
-                seen.add(h)
-                unique.append(item)
-        log.info(f"Total unique news items: {len(unique)}")
-        return unique
+# ─────────────────────────────────────────────────────────────────
+# F&O STOCK UNIVERSE
+# symbol → (bse_code, company_name, nifty_weight%, banknifty_weight%)
+# ─────────────────────────────────────────────────────────────────
 
-# ─────────────────────────────────────────────
-# MODULE 2: NEWS CLASSIFIER
-# ─────────────────────────────────────────────
+FNO = {
+    "HDFCBANK":   ("532275", "HDFC Bank",               11.2, 28.5),
+    "RELIANCE":   ("500325", "Reliance Industries",       9.8,  0.0),
+    "ICICIBANK":  ("532174", "ICICI Bank",                7.1, 22.3),
+    "TCS":        ("532540", "Tata Consultancy Services", 4.8,  0.0),
+    "INFY":       ("500209", "Infosys",                   4.2,  0.0),
+    "KOTAKBANK":  ("500247", "Kotak Mahindra Bank",       3.9, 13.2),
+    "BHARTIARTL": ("532454", "Bharti Airtel",             3.5,  0.0),
+    "LT":         ("500510", "Larsen & Toubro",           3.6,  0.0),
+    "AXISBANK":   ("532215", "Axis Bank",                 3.3, 12.5),
+    "ITC":        ("500875", "ITC",                       3.1,  0.0),
+    "SBIN":       ("500112", "State Bank of India",       3.1, 10.8),
+    "HCLTECH":    ("532281", "HCL Technologies",          2.8,  0.0),
+    "BAJFINANCE": ("500034", "Bajaj Finance",             2.9,  6.4),
+    "HINDUNILVR": ("500696", "Hindustan Unilever",        2.2,  0.0),
+    "MARUTI":     ("532500", "Maruti Suzuki",             2.1,  0.0),
+    "TATAMOTORS": ("500570", "Tata Motors",               1.4,  0.0),
+    "WIPRO":      ("507685", "Wipro",                     1.8,  0.0),
+    "ADANIENT":   ("512599", "Adani Enterprises",         1.8,  0.0),
+    "SUNPHARMA":  ("524715", "Sun Pharmaceuticals",       1.6,  0.0),
+    "ONGC":       ("500312", "ONGC",                      1.5,  0.0),
+    "NTPC":       ("532555", "NTPC",                      1.4,  0.0),
+    "TATASTEEL":  ("500470", "Tata Steel",                1.2,  0.0),
+    "POWERGRID":  ("532898", "Power Grid",                1.0,  0.0),
+    "M&M":        ("500520", "Mahindra & Mahindra",       1.9,  0.0),
+}
 
-CLASSIFIER_SYSTEM = """
-You are a strict financial news classifier for Indian equity markets (Nifty 50, BankNifty).
+# ─────────────────────────────────────────────────────────────────
+# NEWS FEEDS
+# ─────────────────────────────────────────────────────────────────
 
-Your job: read a news headline + summary and return ONLY a JSON object (no markdown, no explanation).
+NEWS_FEEDS = [
+    ("ET Markets",        "https://economictimes.indiatimes.com/markets/rssfeeds/1977021501.cms"),
+    ("ET Economy",        "https://economictimes.indiatimes.com/economy/rssfeeds/1373380680.cms"),
+    ("Moneycontrol",      "https://www.moneycontrol.com/rss/marketsindia.xml"),
+    ("LiveMint Markets",  "https://www.livemint.com/rss/markets"),
+    ("Reuters India",     "https://feeds.reuters.com/reuters/INbusinessNews"),
+    ("NDTV Profit",       "https://feeds.feedburner.com/ndtvprofit-latest"),
+    ("Business Standard", "https://www.business-standard.com/rss/markets-106.rss"),
+]
 
-Categories available:
+# ─────────────────────────────────────────────────────────────────
+# 20-YEAR NIFTY PLAYBOOK
+# ─────────────────────────────────────────────────────────────────
+
+PLAYBOOK = {
+    "election_surprise": {
+        "label": "Election surprise", "icon": "🗳️",
+        "direction": "CRASH", "magnitude": "HIGH",
+        "duration_days": 5, "bn_mult": 1.2,
+        "range": "-8% to -12%",
+        "examples": "May 2004 UPA shock (−12.2%), Jun 2024 BJP below majority (−5.9%)",
+        "keys": ["exit poll", "election result", "hung parliament", "lok sabha",
+                 "coalition", "unexpected win", "majority"],
+    },
+    "election_mandate": {
+        "label": "Election mandate (clear majority)", "icon": "🏆",
+        "direction": "RALLY", "magnitude": "HIGH",
+        "duration_days": 14, "bn_mult": 1.5,
+        "range": "+8% to +18%",
+        "examples": "May 2009 UPA mandate (+17.7%), May 2014 NDA landslide (+8%)",
+        "keys": ["clear majority", "stable government", "policy continuity",
+                 "NDA win", "BJP majority", "single-party majority"],
+    },
+    "global_credit_crisis": {
+        "label": "Global credit / banking crisis", "icon": "🏦",
+        "direction": "CRASH", "magnitude": "EXTREME",
+        "duration_days": 180, "bn_mult": 2.5,
+        "range": "-50% to -65% total drawdown",
+        "examples": "Lehman 2008 (−65% peak-to-trough), SVB 2023 (minor contagion)",
+        "keys": ["bank collapse", "Lehman", "SVB", "credit freeze", "systemic risk",
+                 "bank run", "financial crisis", "sub-prime"],
+    },
+    "pandemic_shock": {
+        "label": "Pandemic / health emergency", "icon": "🦠",
+        "direction": "CRASH", "magnitude": "EXTREME",
+        "duration_days": 30, "bn_mult": 2.0,
+        "range": "-10% to -13% single day",
+        "examples": "COVID Mar 2020 (−12.98% single day, −38% in 30 days)",
+        "keys": ["WHO pandemic", "lockdown", "quarantine", "new virus",
+                 "epidemic", "health emergency", "travel ban", "outbreak"],
+    },
+    "domestic_policy_shock": {
+        "label": "Domestic policy shock", "icon": "⚡",
+        "direction": "CRASH", "magnitude": "HIGH",
+        "duration_days": 60, "bn_mult": 1.0,
+        "range": "-5% to -7%",
+        "examples": "Demonetisation Nov 2016 (−6.3%), LTCG tax Feb 2018 (−5%)",
+        "keys": ["demonetisation", "LTCG", "STT hike", "windfall tax",
+                 "sudden policy", "export ban", "FII cap", "GST rate hike"],
+    },
+    "china_contagion": {
+        "label": "China / EM contagion", "icon": "🇨🇳",
+        "direction": "CRASH", "magnitude": "MEDIUM",
+        "duration_days": 14, "bn_mult": 1.1,
+        "range": "-4% to -7%",
+        "examples": "China Black Monday Aug 2015 (−5.9%), Jan 2016 circuit breaker",
+        "keys": ["yuan devaluation", "PBOC", "China GDP miss", "Shanghai crash",
+                 "EM selloff", "China slowdown", "circuit breaker China"],
+    },
+    "fed_hawkish": {
+        "label": "US Fed hawkishness", "icon": "🦅",
+        "direction": "CRASH", "magnitude": "MEDIUM",
+        "duration_days": 30, "bn_mult": 1.2,
+        "range": "-3% to -7%",
+        "examples": "2013 taper tantrum (rupee to 68), 2022 rate hike cycle (Nifty −18%)",
+        "keys": ["Fed rate hike", "taper tantrum", "hawkish FOMC", "US 10Y yield",
+                 "DXY spike", "Powell hawkish", "higher for longer"],
+    },
+    "oil_shock": {
+        "label": "Oil price shock", "icon": "🛢️",
+        "direction": "CRASH", "magnitude": "MEDIUM",
+        "duration_days": 21, "bn_mult": 1.0,
+        "range": "-2% to -5%",
+        "examples": "2022 Russia-Ukraine (crude to $130), 2025 Hormuz closure",
+        "keys": ["crude above 100", "OPEC cut", "Strait of Hormuz", "oil supply",
+                 "brent spike", "rupee depreciation oil", "CAD widening"],
+    },
+    "domestic_banking_crisis": {
+        "label": "Domestic banking / NBFC crisis", "icon": "🚨",
+        "direction": "CRASH", "magnitude": "HIGH",
+        "duration_days": 30, "bn_mult": 3.0,
+        "range": "-5% to -15% (BankNifty worst hit)",
+        "examples": "IL&FS 2018 (NBFC freeze), Yes Bank 2020 (RBI bailout)",
+        "keys": ["NBFC default", "IL&FS", "Yes Bank", "DHFL", "NPA surge",
+                 "bank fraud", "RBI intervention", "promoter pledge", "short report"],
+    },
+    "rbi_rate_cut": {
+        "label": "RBI rate cut / dovish pivot", "icon": "✂️",
+        "direction": "RALLY", "magnitude": "MEDIUM",
+        "duration_days": 14, "bn_mult": 1.8,
+        "range": "+2% to +5%",
+        "examples": "COVID emergency cuts Apr 2020, Rajan cuts 2015–16, 2024 cut",
+        "keys": ["repo rate cut", "RBI cut", "CRR cut", "dovish MPC",
+                 "RBI accommodative", "rate cycle reversal", "OMO purchase"],
+    },
+    "fed_dovish": {
+        "label": "US Fed rate cut / dovish pivot", "icon": "🕊️",
+        "direction": "RALLY", "magnitude": "MEDIUM",
+        "duration_days": 14, "bn_mult": 1.5,
+        "range": "+2% to +5%",
+        "examples": "Fed cut Sep 2024 (Nifty hit 59 ATHs in 2024), QE 2020",
+        "keys": ["Fed rate cut", "dovish Fed", "QE announced", "Fed pause",
+                 "DXY fall", "FII buying", "EM inflows"],
+    },
+    "growth_budget": {
+        "label": "Growth-oriented Union Budget", "icon": "📋",
+        "direction": "RALLY", "magnitude": "LOW",
+        "duration_days": 3, "bn_mult": 1.0,
+        "range": "+1% to +4%",
+        "examples": "Capex budget 2021, Budget 2014 post-election, Budget 2024",
+        "keys": ["union budget", "capex allocation", "infra spending",
+                 "tax relief", "PLI scheme", "fiscal consolidation", "disinvestment"],
+    },
+    "geopolitical": {
+        "label": "Geopolitical shock", "icon": "⚔️",
+        "direction": "MIXED", "magnitude": "LOW",
+        "duration_days": 3, "bn_mult": 1.0,
+        "range": "-1% to -3% (recovers in 1-3 days)",
+        "examples": "Pulwama 2019, Russia-Ukraine 2022, Indo-Pak 2025",
+        "keys": ["India Pakistan", "border tension", "airstrike", "ceasefire",
+                 "war declaration", "military escalation", "sanctions"],
+    },
+    "heavyweight_earnings": {
+        "label": "Heavyweight stock quarterly results", "icon": "📊",
+        "direction": "MIXED", "magnitude": "LOW",
+        "duration_days": 2, "bn_mult": 2.0,
+        "range": "-3% to +3% (stock); -1.5% to +1.5% (Nifty)",
+        "examples": "HDFC Bank Q3 2024 miss (Nifty −3%), Reliance beat 2023",
+        "keys": ["quarterly results", "earnings miss", "earnings beat", "NIM",
+                 "PAT miss", "revenue miss", "management guidance", "profit"],
+    },
+    "post_crash_recovery": {
+        "label": "Post-crash V-recovery / bull run", "icon": "🚀",
+        "direction": "RALLY", "magnitude": "EXTREME",
+        "duration_days": 365, "bn_mult": 2.0,
+        "range": "+50% to +87% from bottom (over months)",
+        "examples": "2003 (+77%), 2009 (+76%), 2020 (+86.7% by year-end)",
+        "keys": ["GDP recovery", "earnings upgrade", "cheap valuations",
+                 "FII return", "risk-on", "economic revival", "bargain buying"],
+    },
+    "uncategorised": {
+        "label": "Uncategorised / watch", "icon": "👀",
+        "direction": "NEUTRAL", "magnitude": "LOW",
+        "duration_days": 1, "bn_mult": 1.0,
+        "range": "Unclear",
+        "examples": "Does not match any high-confidence historical pattern",
+        "keys": [],
+    },
+}
+
+# ─────────────────────────────────────────────────────────────────
+# MODULE 1 — NEWS FETCHER
+# ─────────────────────────────────────────────────────────────────
+
+def fetch_news(max_per_feed: int = 15) -> list[dict]:
+    items = []
+    for src, url in NEWS_FEEDS:
+        try:
+            feed = feedparser.parse(url, request_headers={"User-Agent": "Mozilla/5.0"})
+            for entry in feed.entries[:max_per_feed]:
+                raw_summary = entry.get("summary", "")
+                clean = BeautifulSoup(raw_summary, "html.parser").get_text()[:400]
+                items.append({
+                    "title":     entry.get("title", "").strip(),
+                    "source":    src,
+                    "url":       entry.get("link", ""),
+                    "published": entry.get("published", ""),
+                    "summary":   clean,
+                })
+        except Exception as e:
+            log.warning(f"Feed error {src}: {e}")
+
+    seen, unique = set(), []
+    for item in items:
+        h = _ck(item["title"][:60])
+        if h not in seen and len(item["title"]) > 10:
+            seen.add(h)
+            unique.append(item)
+    return unique
+
+# ─────────────────────────────────────────────────────────────────
+# MODULE 2 — NEWS CLASSIFIER (Claude)
+# ─────────────────────────────────────────────────────────────────
+
+_CLASSIFY_SYS = """
+You are a strict financial news classifier for Indian equity markets (Nifty 50, BankNifty, NSE F&O).
+
+Read the headline and summary. Return ONLY valid JSON — no markdown, no preamble, nothing else.
+
+Category keys (use exactly one):
 election_surprise, election_mandate, global_credit_crisis, pandemic_shock,
 domestic_policy_shock, china_contagion, fed_hawkish, oil_shock,
 domestic_banking_crisis, rbi_rate_cut, fed_dovish, growth_budget,
 geopolitical, heavyweight_earnings, post_crash_recovery, uncategorised
 
-Return this exact JSON structure:
+Required JSON structure:
 {
-  "category": "<category_key>",
-  "confidence": <0-100 integer>,
+  "category": "<key>",
+  "confidence": <0-100>,
   "direction": "<RALLY|CRASH|MIXED|NEUTRAL>",
   "magnitude": "<LOW|MEDIUM|HIGH|EXTREME>",
   "timing": "<IMMEDIATE|TOMORROW|3DAYS|WEEK>",
-  "nifty_impact_range": "<e.g. -1% to -3%>",
-  "banknifty_multiplier": <1.0 to 3.0>,
-  "affected_sectors": ["sector1", "sector2"],
-  "reasoning": "<one sentence max>",
-  "is_material": <true|false>
+  "nifty_impact": "<e.g. -1% to -3%>",
+  "bn_multiplier": <1.0-3.0>,
+  "sectors": ["sector1", "sector2"],
+  "reasoning": "<one sentence, max 20 words>",
+  "is_material": <true|false>,
+  "related_stock": "<NSE symbol if news is about one specific F&O company, else null>"
 }
 
 Rules:
-- confidence below 40 → category = "uncategorised", is_material = false
-- Only mark is_material = true if the news could move Nifty by more than 0.5% today or tomorrow
-- MIXED direction means the news cuts both ways (e.g. geopolitical: brief dip then defence rally)
-- For BankNifty multiplier: 1.0 = same as Nifty, 2.0 = moves 2x, 3.0 = extreme banking impact
+- confidence < 40  →  category = "uncategorised", is_material = false
+- is_material = true only if this could move Nifty by more than 0.5% today or tomorrow
+- MIXED = cuts both ways (e.g. geopolitical: brief dip then defence stocks rally)
+- bn_multiplier: 1.0 = same as Nifty, 2.0 = BankNifty moves 2× Nifty, 3.0 = extreme banking event
 """
 
-class NewsClassifier:
-    def classify(self, item: NewsItem) -> dict:
-        user = f"Headline: {item.title}\nSource: {item.source}\nSummary: {item.summary[:300]}"
-        raw = _claude(CLASSIFIER_SYSTEM, user, max_tokens=400)
-        try:
-            # Strip any accidental markdown fences
-            raw = raw.strip().lstrip("```json").rstrip("```").strip()
-            return json.loads(raw)
-        except json.JSONDecodeError:
-            log.warning(f"JSON parse failed for: {item.title[:50]}")
-            return {"category": "uncategorised", "confidence": 0, "is_material": False}
+def classify_one(item: dict) -> dict:
+    user = (f"Headline: {item['title']}\n"
+            f"Source: {item['source']}\n"
+            f"Summary: {item['summary'][:300]}")
+    raw = _claude(_CLASSIFY_SYS, user, max_tokens=350, ttl=120)
+    result = _json(raw)
+    if not result or "category" not in result:
+        return {"category": "uncategorised", "confidence": 0,
+                "is_material": False, "direction": "NEUTRAL", "magnitude": "LOW"}
+    return result
 
-    def classify_batch(self, items: list[NewsItem]) -> list[tuple[NewsItem, dict]]:
-        results = []
-        for item in items:
-            classification = self.classify(item)
-            results.append((item, classification))
-        return results
+# ─────────────────────────────────────────────────────────────────
+# MODULE 3 — EARNINGS CALENDAR (BSE API)
+# ─────────────────────────────────────────────────────────────────
 
-# ─────────────────────────────────────────────
-# MODULE 3: EARNINGS CALENDAR
-# ─────────────────────────────────────────────
+def _bse_result_date(bse_code: str) -> Optional[date]:
+    ck = f"bse_{bse_code}"
+    cached = _rcache(ck, ttl_min=480)
+    if cached is not None:
+        val = cached.get("d")
+        return date.fromisoformat(val) if val else None
 
-class EarningsCalendar:
-    """
-    Fetches upcoming result dates from BSE corporate filings API.
-    BSE exposes board meeting notices which announce result dates.
-    """
-
-    BSE_BOARD_MEETING_URL = (
-        "https://api.bseindia.com/BseIndiaAPI/api/DefaultData/w"
-        "?Type=BoardMeeting&subcateg=RESULT&pageno=1&trade_date="
-    )
-
-    def get_upcoming_results(self, days_ahead: int = 7) -> list[dict]:
-        """
-        Returns list of {symbol, company, bse_code, result_date, days_away}
-        for all F&O stocks with results in the next `days_ahead` days.
-        """
-        upcoming = []
+    try:
+        url = (f"https://api.bseindia.com/BseIndiaAPI/api/DefaultData/w"
+               f"?Type=BoardMeeting&scripcode={bse_code}")
+        hdrs = {"User-Agent": "Mozilla/5.0", "Referer": "https://www.bseindia.com/"}
+        data = requests.get(url, headers=hdrs, timeout=12).json()
         today = date.today()
-
-        for nse_sym, (bse_code, company) in FNO_STOCKS.items():
-            result_date = self._fetch_result_date(bse_code, company)
-            if result_date is None:
-                continue
-            days_away = (result_date - today).days
-            if 0 <= days_away <= days_ahead:
-                upcoming.append({
-                    "symbol": nse_sym,
-                    "bse_code": bse_code,
-                    "company": company,
-                    "result_date": result_date,
-                    "days_away": days_away,
-                })
-
-        log.info(f"Upcoming results in {days_ahead} days: {len(upcoming)}")
-        return sorted(upcoming, key=lambda x: x["days_away"])
-
-    def _fetch_result_date(self, bse_code: str, company: str) -> Optional[date]:
-        """Queries BSE API for next board meeting (result) date."""
-        ck = f"bse_result_{bse_code}"
-        cached = _read_cache(ck, ttl_minutes=360)  # cache 6 hours
-        if cached:
-            return date.fromisoformat(cached["date"]) if cached.get("date") else None
-
-        try:
-            url = f"https://api.bseindia.com/BseIndiaAPI/api/DefaultData/w?Type=BoardMeeting&scripcode={bse_code}"
-            headers = {
-                "User-Agent": "Mozilla/5.0",
-                "Referer": "https://www.bseindia.com/",
-            }
-            resp = requests.get(url, headers=headers, timeout=10)
-            data = resp.json()
-            # BSE returns a list of meetings; find next upcoming RESULT meeting
-            today = date.today()
-            for meeting in data.get("Table", []):
-                purpose = str(meeting.get("Purpose", "")).upper()
-                if "RESULT" in purpose or "FINANCIAL" in purpose:
-                    raw_date = meeting.get("Meeting_Date", "")
+        for m in data.get("Table", []):
+            p = str(m.get("Purpose", "")).upper()
+            if any(k in p for k in ("RESULT", "FINANCIAL", "QUARTERLY")):
+                raw = m.get("Meeting_Date", "")
+                for fmt in ("%d %b %Y", "%Y-%m-%d", "%d/%m/%Y"):
                     try:
-                        # BSE format: "27 Jun 2026" or "2026-06-27"
-                        try:
-                            d = datetime.strptime(raw_date, "%d %b %Y").date()
-                        except ValueError:
-                            d = datetime.fromisoformat(raw_date[:10]).date()
+                        d = datetime.strptime(raw[:11].strip(), fmt).date()
                         if d >= today:
-                            _write_cache(ck, {"date": d.isoformat()})
+                            _wcache(ck, {"d": d.isoformat()})
                             return d
-                    except Exception:
+                    except ValueError:
                         continue
-        except Exception as e:
-            log.debug(f"BSE API failed for {bse_code}: {e}")
+    except Exception as e:
+        log.debug(f"BSE date fetch failed {bse_code}: {e}")
 
-        _write_cache(ck, {"date": None})
-        return None
+    _wcache(ck, {"d": None})
+    return None
 
-# ─────────────────────────────────────────────
-# MODULE 4: FINANCIAL STATEMENT READER
-# ─────────────────────────────────────────────
+def earnings_calendar(days_ahead: int = 7) -> list[dict]:
+    today = date.today()
+    out = []
+    for sym, (bse, company, nw, bw) in FNO.items():
+        d = _bse_result_date(bse)
+        if d is None:
+            continue
+        away = (d - today).days
+        if 0 <= away <= days_ahead:
+            out.append({"symbol": sym, "company": company,
+                        "result_date": d, "days_away": away,
+                        "nifty_wt": nw, "bn_wt": bw})
+    return sorted(out, key=lambda x: x["days_away"])
 
-QUARTERLY_METRICS = [
-    "Revenue / Net Sales", "EBITDA", "EBITDA Margin %",
-    "PAT (Profit After Tax)", "EPS (Basic)", "Gross NPA %",
-    "Net NPA %", "NIM (Net Interest Margin)", "Loan Growth YoY %",
-    "Revenue Growth YoY %", "PAT Growth YoY %",
-    "Operating Cash Flow", "Debt / Equity", "ROE %",
-]
+# ─────────────────────────────────────────────────────────────────
+# MODULE 4 — QUARTERLY FINANCIALS (Screener.in)
+# ─────────────────────────────────────────────────────────────────
 
-STATEMENT_ANALYSER_SYSTEM = """
-You are a senior equity analyst specialising in Indian listed companies.
+def _screener_data(sym: str) -> Optional[dict]:
+    ck = f"scr_{sym}"
+    cached = _rcache(ck, ttl_min=720)
+    if cached:
+        return cached
 
-Given the latest quarterly result headline data for a company, and the same quarter last year's data,
-perform a strict fundamental analysis and return ONLY JSON (no markdown, no preamble):
+    # Try JSON API first
+    try:
+        url = f"https://www.screener.in/api/company/{sym}/quarters/?format=json"
+        r = requests.get(url, headers={"User-Agent": "Mozilla/5.0"}, timeout=15)
+        if r.status_code == 200:
+            data = r.json()
+            _wcache(ck, data)
+            return data
+    except Exception:
+        pass
 
+    # Fallback: HTML scrape
+    try:
+        url = f"https://www.screener.in/company/{sym}/consolidated/"
+        r = requests.get(url, headers={"User-Agent": "Mozilla/5.0"}, timeout=15)
+        soup = BeautifulSoup(r.text, "html.parser")
+        table = soup.select_one("#quarters table")
+        if table:
+            hdrs = [th.get_text(strip=True) for th in table.select("thead th")]
+            rows = []
+            for tr in table.select("tbody tr"):
+                cells = [td.get_text(strip=True) for td in tr.select("td")]
+                if cells:
+                    rows.append(dict(zip(hdrs, cells)))
+            data = {"quarters": rows, "src": "html"}
+            _wcache(ck, data)
+            return data
+    except Exception:
+        pass
+
+    return None
+
+def _price_reactions(sym: str) -> list[float]:
+    try:
+        import yfinance as yf
+        hist = yf.Ticker(f"{sym}.NS").history(period="2y")
+        if hist.empty:
+            return []
+        pct = hist["Close"].pct_change().dropna() * 100
+        top = pct.abs().nlargest(8)
+        return [round(pct[i], 2) for i in top.index[:4]]
+    except Exception:
+        return []
+
+_EARNINGS_SYS = """
+You are a senior equity analyst covering NSE-listed Indian companies.
+Given quarterly financial data from Screener.in and historical result-day price reactions,
+perform a rigorous YoY and QoQ analysis.
+
+Return ONLY valid JSON — no markdown, no preamble:
 {
   "quarter": "<e.g. Q4FY26>",
-  "beat_or_miss": "<BEAT|MISS|IN_LINE>",
-  "key_positive": ["up to 3 bullet points"],
-  "key_negative": ["up to 3 bullet points"],
-  "watch_metrics": ["most important 3 metrics to watch"],
-  "historical_avg_move_pct": <float, e.g. 3.5 for +3.5% or -2.1 for -2.1%>,
-  "bull_case_move": "<e.g. +3% to +6%>",
-  "bear_case_move": "<e.g. -5% to -8%>",
-  "nifty_impact": "<e.g. +0.5% to +1.2%>",
-  "banknifty_impact": "<only fill if banking stock, else null>",
+  "yoy_revenue_growth": "<e.g. +12.3% or Not available>",
+  "yoy_pat_growth": "<e.g. +8.5% or Not available>",
+  "qoq_pat_growth": "<e.g. -2.1% or Not available>",
+  "expectation": "<LIKELY BEAT|LIKELY MISS|IN LINE|UNCERTAIN>",
+  "positives": ["point 1", "point 2", "point 3"],
+  "risks": ["risk 1", "risk 2", "risk 3"],
+  "watch_metrics": ["metric 1", "metric 2", "metric 3"],
+  "avg_result_day_move": <float e.g. -2.3>,
+  "bull_stock": "<e.g. +3% to +6%>",
+  "bear_stock": "<e.g. -5% to -8%>",
+  "nifty_bull": "<e.g. +0.4% to +0.9%>",
+  "nifty_bear": "<e.g. -0.8% to -1.5%>",
+  "banknifty": "<impact for banking stocks only, else 'N/A'>",
   "confidence": <0-100>,
-  "summary": "<2 sentences max>"
+  "summary": "<max 25 words>"
 }
 
-Be strict. Missing data = say so. Never hallucinate numbers.
+Rules:
+- Banking stocks: focus on NIM, GNPA, NNPA, loan growth, deposit growth, credit cost
+- IT stocks: focus on revenue guidance, deal TCV, attrition, EBIT margins, constant currency growth
+- Never hallucinate numbers — say 'Not available' if data is missing
+- UNCERTAIN is better than false confidence
 """
 
-class FinancialStatementReader:
-    """
-    Reads quarterly filing data.
-    Primary source: Screener.in JSON API (no auth needed).
-    Fallback: NSE XBRL API.
-    """
+def analyse_earnings(sym: str, company: str) -> Optional[dict]:
+    qdata = _screener_data(sym)
+    reactions = _price_reactions(sym)
+    avg = round(sum(reactions) / len(reactions), 2) if reactions else 0.0
+    quarter = _quarter()
 
-    SCREENER_URL = "https://www.screener.in/api/company/{nse_sym}/quarters/?format=json"
-
-    def get_quarterly_data(self, nse_sym: str) -> Optional[dict]:
-        ck = f"screener_{nse_sym}"
-        cached = _read_cache(ck, ttl_minutes=720)  # 12h cache
-        if cached:
-            return cached
-
-        try:
-            url = f"https://www.screener.in/api/company/{nse_sym}/quarters/?format=json"
-            headers = {"User-Agent": "Mozilla/5.0 (research bot)"}
-            resp = requests.get(url, headers=headers, timeout=15)
-            if resp.status_code == 200:
-                data = resp.json()
-                _write_cache(ck, data)
-                return data
-        except Exception as e:
-            log.debug(f"Screener API failed for {nse_sym}: {e}")
-
-        # Fallback: Screener HTML scrape
-        try:
-            url = f"https://www.screener.in/company/{nse_sym}/consolidated/"
-            resp = requests.get(url, headers={"User-Agent": "Mozilla/5.0"}, timeout=15)
-            soup = BeautifulSoup(resp.text, "html.parser")
-            # Parse quarterly table
-            table = soup.select_one("#quarters table")
-            if table:
-                rows = []
-                headers_row = [th.text.strip() for th in table.select("thead th")]
-                for tr in table.select("tbody tr"):
-                    cells = [td.text.strip() for td in tr.select("td")]
-                    if cells:
-                        rows.append(dict(zip(headers_row, cells)))
-                data = {"quarters": rows}
-                _write_cache(ck, data)
-                return data
-        except Exception as e:
-            log.debug(f"Screener scrape failed for {nse_sym}: {e}")
-
-        return None
-
-    def get_historical_result_reactions(self, nse_sym: str) -> list[float]:
-        """
-        Fetches stock price change on result day for last 4 quarters.
-        Uses yfinance as the data source (already a dependency in System 1818).
-        Returns list of % changes, e.g. [-4.7, 3.2, 1.1, -2.3]
-        """
-        try:
-            import yfinance as yf
-            ticker = yf.Ticker(f"{nse_sym}.NS")
-            hist = ticker.history(period="2y")
-            if hist.empty:
-                return []
-            # Proxy: look at largest single-day moves as result-day reactions
-            # In production you'd map to actual result dates; here we return top moves
-            daily_returns = hist["Close"].pct_change().dropna() * 100
-            largest_moves = daily_returns.abs().nlargest(8).index
-            reactions = [round(daily_returns[d], 2) for d in largest_moves[:4]]
-            return reactions
-        except Exception:
-            return []
-
-    def analyse_earnings(self, nse_sym: str, company: str, quarter: str) -> Optional[dict]:
-        """Full earnings analysis using Claude."""
-        qdata = self.get_quarterly_data(nse_sym)
-        if not qdata:
-            return None
-
-        reactions = self.get_historical_result_reactions(nse_sym)
-        avg_reaction = round(sum(reactions) / len(reactions), 2) if reactions else 0.0
-
-        user_prompt = f"""
-Company: {company} ({nse_sym})
-Quarter: {quarter}
-Historical result-day reactions (last 4 quarters): {reactions}
-Average historical move on result day: {avg_reaction}%
-
-Quarterly financial data (latest available):
-{json.dumps(qdata, indent=2)[:3000]}
-
-Analyse:
-1. How does latest quarter compare to same quarter last year?
-2. What are the 3 most critical metrics to watch in this release?
-3. What is the bull case and bear case price reaction?
-4. What is the likely impact on Nifty and BankNifty (if applicable)?
-"""
-        raw = _claude(STATEMENT_ANALYSER_SYSTEM, user_prompt, max_tokens=600)
-        try:
-            raw = raw.strip().lstrip("```json").rstrip("```").strip()
-            result = json.loads(raw)
-            result["historical_reactions"] = reactions
-            result["avg_historical_reaction_pct"] = avg_reaction
-            return result
-        except json.JSONDecodeError:
-            log.warning(f"Earnings JSON parse failed for {nse_sym}")
-            return None
-
-# ─────────────────────────────────────────────
-# MODULE 5: SIGNAL AGGREGATOR
-# ─────────────────────────────────────────────
-
-class SignalAggregator:
-    """Combines news signals and earnings signals into a unified output."""
-
-    # Nifty 50 weight approximations (update periodically)
-    NIFTY_WEIGHTS = {
-        "HDFCBANK": 11.2, "RELIANCE": 9.8, "ICICIBANK": 7.1,
-        "TCS": 4.8, "INFY": 4.2, "KOTAKBANK": 3.9, "LT": 3.6,
-        "AXISBANK": 3.3, "SBIN": 3.1, "WIPRO": 1.8, "BAJFINANCE": 2.9,
-    }
-    BANKNIFTY_WEIGHTS = {
-        "HDFCBANK": 28.5, "ICICIBANK": 22.3, "KOTAKBANK": 13.2,
-        "AXISBANK": 12.5, "SBIN": 10.8, "BAJFINANCE": 6.4,
-    }
-
-    def build_news_signal(self, item: NewsItem, clf: dict) -> Optional[NewsSignal]:
-        if not clf.get("is_material", False):
-            return None
-        cat = clf.get("category", "uncategorised")
-        cat_meta = PLAYBOOK.get(cat, PLAYBOOK["uncategorised"])
-        return NewsSignal(
-            headline=item.title,
-            source=item.source,
-            category=cat,
-            category_label=cat_meta["label"],
-            direction=clf.get("direction", "NEUTRAL"),
-            magnitude=clf.get("magnitude", "LOW"),
-            confidence=clf.get("confidence", 0),
-            nifty_impact=clf.get("nifty_impact_range", "unclear"),
-            banknifty_impact=f'{clf.get("banknifty_multiplier", 1.0):.1f}x Nifty move',
-            timing=clf.get("timing", "WEEK"),
-            affected_sectors=clf.get("affected_sectors", []),
-            reasoning=clf.get("reasoning", ""),
-            timestamp=datetime.now().isoformat(),
-        )
-
-    def get_nifty_weight(self, symbol: str) -> float:
-        return self.NIFTY_WEIGHTS.get(symbol, 0.5)
-
-    def get_banknifty_weight(self, symbol: str) -> float:
-        return self.BANKNIFTY_WEIGHTS.get(symbol, 0.0)
-
-    def build_overall_view(self, news_signals: list[NewsSignal], earnings: list[dict]) -> dict:
-        """Aggregate all signals into a single market view for the day."""
-        crash_signals = [s for s in news_signals if s.direction == "CRASH"]
-        rally_signals = [s for s in news_signals if s.direction == "RALLY"]
-
-        # Score: HIGH=3, MEDIUM=2, LOW=1, EXTREME=4
-        mag_score = {"LOW": 1, "MEDIUM": 2, "HIGH": 3, "EXTREME": 4}
-        crash_score = sum(mag_score.get(s.magnitude, 1) * (s.confidence / 100)
-                          for s in crash_signals)
-        rally_score = sum(mag_score.get(s.magnitude, 1) * (s.confidence / 100)
-                          for s in rally_signals)
-
-        net = rally_score - crash_score
-        if net > 2:
-            overall = "BULLISH"
-        elif net > 0.5:
-            overall = "SLIGHTLY BULLISH"
-        elif net < -2:
-            overall = "BEARISH"
-        elif net < -0.5:
-            overall = "SLIGHTLY BEARISH"
-        else:
-            overall = "NEUTRAL"
-
-        # Top signals by confidence
-        top_signals = sorted(news_signals, key=lambda s: s.confidence, reverse=True)[:5]
-
+    if not qdata:
         return {
-            "overall_market_view": overall,
-            "net_signal_score": round(net, 2),
-            "crash_signals_count": len(crash_signals),
-            "rally_signals_count": len(rally_signals),
-            "top_signals": [asdict(s) for s in top_signals],
-            "earnings_today_tomorrow": earnings,
-            "generated_at": datetime.now().isoformat(),
+            "summary": f"No quarterly data found for {company}",
+            "expectation": "UNCERTAIN",
+            "confidence": 0,
+            "avg_result_day_move": avg,
+            "reactions": reactions,
+            "quarter": quarter,
         }
 
-# ─────────────────────────────────────────────
-# MODULE 6: MAIN BOT ORCHESTRATOR
-# ─────────────────────────────────────────────
+    user = (f"Company: {company} (NSE: {sym})\n"
+            f"Quarter being analysed: {quarter}\n"
+            f"Historical result-day reactions last 4 quarters (%): {reactions}\n"
+            f"Average historical move on result day: {avg}%\n\n"
+            f"Quarterly financial data:\n"
+            f"{json.dumps(qdata, indent=2)[:3500]}\n\n"
+            f"Analyse YoY and QoQ trends. Identify the 3 most critical metrics. "
+            f"Give bull and bear case stock price reactions and Nifty impact.")
 
-class NewsEarningsBot:
-    """
-    Main entry point. Call run_full_scan() to get the complete market intelligence report.
-    Integrates into System 1818 via the returned dict.
-    """
+    raw = _claude(_EARNINGS_SYS, user, max_tokens=700, ttl=360)
+    result = _json(raw)
+    if result:
+        result["reactions"] = reactions
+        result["avg_result_day_move"] = avg
+    return result or None
 
-    def __init__(self):
-        self.fetcher     = NewsFetcher()
-        self.classifier  = NewsClassifier()
-        self.cal         = EarningsCalendar()
-        self.fin_reader  = FinancialStatementReader()
-        self.aggregator  = SignalAggregator()
+def _quarter() -> str:
+    today = date.today()
+    m, y = today.month, today.year
+    fy = y if m >= 4 else y - 1
+    q = ("Q1" if m in (4,5,6) else "Q2" if m in (7,8,9) else
+         "Q3" if m in (10,11,12) else "Q4")
+    return f"{q}FY{str(fy+1)[2:]}"
 
-    def run_full_scan(self, news_limit: int = 60) -> dict:
-        """
-        Full pipeline:
-        1. Fetch latest news
-        2. Classify each headline
-        3. Fetch upcoming earnings (next 3 days)
-        4. Analyse earnings filings for any results tomorrow
-        5. Aggregate into overall market view
-        Returns complete signal dict.
-        """
-        log.info("=== NewsEarningsBot full scan started ===")
+# ─────────────────────────────────────────────────────────────────
+# MODULE 5 — SIGNAL AGGREGATOR
+# ─────────────────────────────────────────────────────────────────
 
-        # Step 1: Fetch news
-        all_news = self.fetcher.fetch_all(max_per_feed=20)
-        recent_news = all_news[:news_limit]
+def overall_view(signals: list[dict]) -> dict:
+    W = {"LOW": 1, "MEDIUM": 2, "HIGH": 3, "EXTREME": 4}
+    crash  = [s for s in signals if s.get("direction") == "CRASH"]
+    rally  = [s for s in signals if s.get("direction") == "RALLY"]
+    cs = sum(W.get(s.get("magnitude","LOW"),1) * s.get("confidence",0)/100 for s in crash)
+    rs = sum(W.get(s.get("magnitude","LOW"),1) * s.get("confidence",0)/100 for s in rally)
+    net = rs - cs
 
-        # Step 2: Classify
-        log.info(f"Classifying {len(recent_news)} headlines...")
-        classified = self.classifier.classify_batch(recent_news)
+    if   net >  3:   lbl, col = "STRONGLY BULLISH",  "success"
+    elif net >  1:   lbl, col = "BULLISH",            "success"
+    elif net >  0.3: lbl, col = "SLIGHTLY BULLISH",   "success"
+    elif net < -3:   lbl, col = "STRONGLY BEARISH",   "error"
+    elif net < -1:   lbl, col = "BEARISH",            "error"
+    elif net < -0.3: lbl, col = "SLIGHTLY BEARISH",   "error"
+    else:            lbl, col = "NEUTRAL",             "warning"
 
-        # Step 3: Build news signals (material only)
-        news_signals = []
-        for item, clf in classified:
-            sig = self.aggregator.build_news_signal(item, clf)
-            if sig:
-                news_signals.append(sig)
-        log.info(f"Material news signals: {len(news_signals)}")
+    return {"label": lbl, "color": col, "net": round(net,2),
+            "crash": len(crash), "rally": len(rally)}
 
-        # Step 4: Earnings calendar
-        upcoming = self.cal.get_upcoming_results(days_ahead=3)
-        log.info(f"Upcoming earnings (3 days): {len(upcoming)}")
+# ─────────────────────────────────────────────────────────────────
+# UI HELPERS
+# ─────────────────────────────────────────────────────────────────
 
-        # Step 5: Deep analyse stocks with results tomorrow or today
-        earnings_analyses = []
-        for event in upcoming:
-            if event["days_away"] <= 1:  # today or tomorrow
-                sym = event["symbol"]
-                company = event["company"]
-                quarter = self._current_quarter()
-                log.info(f"Analysing earnings: {sym} ({quarter})")
-                analysis = self.fin_reader.analyse_earnings(sym, company, quarter)
-                if analysis:
-                    analysis.update({
-                        "symbol": sym,
-                        "company": company,
-                        "result_date": event["result_date"].isoformat(),
-                        "days_away": event["days_away"],
-                        "nifty_weight": self.aggregator.get_nifty_weight(sym),
-                        "banknifty_weight": self.aggregator.get_banknifty_weight(sym),
-                    })
-                    earnings_analyses.append(analysis)
+def _badge(direction: str) -> str:
+    C = {
+        "CRASH":   ("#fcebeb","#a32d2d"),
+        "RALLY":   ("#eaf3de","#3b6d11"),
+        "MIXED":   ("#faeeda","#854f0b"),
+        "NEUTRAL": ("#f1efe8","#5f5e5a"),
+    }
+    bg, fg = C.get(direction, C["NEUTRAL"])
+    return (f'<span style="background:{bg};color:{fg};padding:2px 10px;'
+            f'border-radius:20px;font-size:12px;font-weight:500">{direction}</span>')
 
-        # Step 6: Aggregate
-        overall = self.aggregator.build_overall_view(news_signals, earnings_analyses)
-        overall["upcoming_earnings_calendar"] = [
-            {
-                "symbol": e["symbol"],
-                "company": e["company"],
-                "result_date": e["result_date"].isoformat(),
-                "days_away": e["days_away"],
-            }
-            for e in upcoming
-        ]
-        overall["all_news_signals_count"] = len(news_signals)
+def _mbadge(mag: str) -> str:
+    C = {
+        "EXTREME": ("#a32d2d","#fff"),
+        "HIGH":    ("#fcebeb","#a32d2d"),
+        "MEDIUM":  ("#faeeda","#854f0b"),
+        "LOW":     ("#eaf3de","#3b6d11"),
+    }
+    bg, fg = C.get(mag, ("#f1efe8","#5f5e5a"))
+    return (f'<span style="background:{bg};color:{fg};padding:2px 8px;'
+            f'border-radius:20px;font-size:11px">{mag}</span>')
 
-        log.info("=== Scan complete ===")
-        log.info(f"Overall market view: {overall['overall_market_view']}")
-        return overall
+# ─────────────────────────────────────────────────────────────────
+# MAIN APP
+# ─────────────────────────────────────────────────────────────────
 
-    def run_news_only(self, limit: int = 40) -> list[dict]:
-        """Lightweight scan — news signals only, no earnings."""
-        news = self.fetcher.fetch_all(max_per_feed=15)[:limit]
-        classified = self.classifier.classify_batch(news)
-        signals = []
-        for item, clf in classified:
-            sig = self.aggregator.build_news_signal(item, clf)
-            if sig:
-                signals.append(asdict(sig))
-        return signals
+def main():
 
-    def analyse_single_stock_earnings(self, nse_sym: str) -> Optional[dict]:
-        """Analyse a specific stock's earnings outlook on demand."""
-        if nse_sym not in FNO_STOCKS:
-            return {"error": f"{nse_sym} not in F&O watchlist"}
-        _, company = FNO_STOCKS[nse_sym]
-        return self.fin_reader.analyse_earnings(nse_sym, company, self._current_quarter())
+    # ── SIDEBAR ─────────────────────────────────────────────────
+    with st.sidebar:
+        st.markdown("## 📰 System 1818 News")
+        st.markdown("*NSE Market Intelligence*")
+        st.divider()
 
-    @staticmethod
-    def _current_quarter() -> str:
-        today = date.today()
-        month = today.month
-        year = today.year
-        fy = year if month >= 4 else year - 1
-        if month in (4, 5, 6):
-            q = "Q1"
-        elif month in (7, 8, 9):
-            q = "Q2"
-        elif month in (10, 11, 12):
-            q = "Q3"
-        else:
-            q = "Q4"
-        return f"{q}FY{str(fy + 1)[2:]}"
+        st.markdown("### Scan settings")
+        news_count   = st.slider("Headlines to scan",       20, 120, 60, step=10)
+        earn_days    = st.slider("Earnings look-ahead (days)", 1, 14, 5)
+        min_conf     = st.slider("Min signal confidence",   30,  80, 50)
+        st.divider()
 
+        st.markdown("### Quick earnings analysis")
+        co_map = {v[1]: k for k, v in FNO.items()}
+        sel_co = st.selectbox("Pick a stock", sorted(co_map.keys()))
+        analyse_btn = st.button("Analyse this stock ↗", use_container_width=True)
+        st.divider()
 
-# ─────────────────────────────────────────────
-# STREAMLIT INTEGRATION HELPER
-# ─────────────────────────────────────────────
+        run_btn = st.button("Run full scan ↗", type="primary", use_container_width=True)
 
-def render_streamlit_panel():
-    """
-    Drop this into your System 1818 Streamlit app.
-    Call from your main dashboard tab.
-    """
-    import streamlit as st
+        if not get_api_key():
+            st.error("ANTHROPIC_API_KEY not found.\nAdd it in Streamlit → Settings → Secrets.")
 
-    st.subheader("News and Earnings Intelligence")
+    # ── TABS ─────────────────────────────────────────────────────
+    t_overview, t_news, t_earnings, t_playbook = st.tabs([
+        "Market overview", "Live news signals", "Earnings calendar", "Playbook"
+    ])
 
-    col1, col2 = st.columns([3, 1])
-    with col2:
-        scan_type = st.selectbox("Scan type", ["Full scan", "News only"])
-        if st.button("Run scan"):
-            st.session_state["bot_scanning"] = True
+    # ════════════════════════════════════════════════════════════
+    # TAB: PLAYBOOK  (always visible — no API needed)
+    # ════════════════════════════════════════════════════════════
+    with t_playbook:
+        st.markdown("### 20-year Nifty news-category playbook")
+        st.caption("Historical patterns 2004–2024. Categories are based on real market events.")
 
-    if st.session_state.get("bot_scanning"):
-        bot = NewsEarningsBot()
-        with st.spinner("Scanning news and earnings..."):
-            if scan_type == "Full scan":
-                result = bot.run_full_scan()
+        fdir = st.radio("Filter by direction", ["All","CRASH","RALLY","MIXED"], horizontal=True)
+
+        for key, cat in PLAYBOOK.items():
+            if key == "uncategorised":
+                continue
+            if fdir != "All" and cat["direction"] != fdir:
+                continue
+            with st.expander(f"{cat['icon']}  {cat['label']}  —  {cat['direction']}  ·  {cat['magnitude']}"):
+                c1, c2, c3 = st.columns(3)
+                c1.markdown(f"**Direction:** {cat['direction']}")
+                c2.markdown(f"**Magnitude:** {cat['magnitude']}")
+                c3.markdown(f"**Typical duration:** {cat['duration_days']} days")
+                c4, c5 = st.columns(2)
+                c4.markdown(f"**Historical range:** `{cat['range']}`")
+                c5.markdown(f"**BankNifty multiplier:** {cat['bn_mult']}×")
+                st.markdown(f"**Historical examples:** {cat['examples']}")
+                st.markdown(f"**Trigger keywords:** `{'` · `'.join(cat['keys'][:6])}`")
+
+    # ════════════════════════════════════════════════════════════
+    # TAB: EARNINGS CALENDAR
+    # ════════════════════════════════════════════════════════════
+    with t_earnings:
+        st.markdown("### Earnings calendar and deep analysis")
+
+        # Quick analysis from sidebar
+        if analyse_btn:
+            sym = co_map[sel_co]
+            _, company, nw, bw = FNO[sym]
+            st.markdown(f"#### {company}  ({sym})  —  {_quarter()} analysis")
+            with st.spinner(f"Fetching financials for {company}…"):
+                an = analyse_earnings(sym, company)
+
+            if an:
+                exp  = an.get("expectation", "UNCERTAIN")
+                conf = an.get("confidence", 0)
+                ecol = "success" if "BEAT" in exp else "error" if "MISS" in exp else "warning"
+
+                m1, m2, m3, m4 = st.columns(4)
+                m1.metric("Nifty weight",        f"{nw:.1f}%")
+                m2.metric("BankNifty weight",    f"{bw:.1f}%" if bw > 0 else "N/A")
+                m3.metric("Avg result-day move", f"{an.get('avg_result_day_move',0):+.1f}%")
+                m4.metric("Analysis confidence", f"{conf}%")
+
+                getattr(st, ecol)(f"**Expectation: {exp}**")
+                st.caption(an.get("summary", ""))
+
+                a1, a2 = st.columns(2)
+                a1.metric("Revenue growth YoY", an.get("yoy_revenue_growth", "N/A"))
+                a2.metric("PAT growth YoY",     an.get("yoy_pat_growth",     "N/A"))
+
+                b1, b2 = st.columns(2)
+                with b1:
+                    st.markdown("**Bull case**")
+                    st.success(f"Stock: {an.get('bull_stock','—')}\nNifty: {an.get('nifty_bull','—')}")
+                    for pt in an.get("positives", []):
+                        st.markdown(f"+ {pt}")
+                with b2:
+                    st.markdown("**Bear case**")
+                    st.error(f"Stock: {an.get('bear_stock','—')}\nNifty: {an.get('nifty_bear','—')}")
+                    for pt in an.get("risks", []):
+                        st.markdown(f"- {pt}")
+
+                st.markdown("**Critical metrics to watch on result day:**")
+                for m in an.get("watch_metrics", []):
+                    st.markdown(f"• {m}")
+
+                if bw > 0 and an.get("banknifty") not in (None, "N/A", ""):
+                    st.info(f"**BankNifty impact:** {an.get('banknifty')}")
+
+                st.caption(f"Historical result-day moves: {an.get('reactions', [])}")
             else:
-                signals = bot.run_news_only()
-                result = {"top_signals": signals, "overall_market_view": "—"}
-        st.session_state["bot_result"] = result
-        st.session_state["bot_scanning"] = False
+                st.warning("Could not fetch financial data. Screener.in may be rate-limiting.")
 
-    result = st.session_state.get("bot_result")
-    if not result:
-        st.info("Click 'Run scan' to fetch live news and earnings signals.")
-        return
+        # Calendar from last full scan
+        cal = st.session_state.get("cal", [])
+        if cal:
+            st.divider()
+            st.markdown("#### Upcoming results (from last full scan)")
+            for ev in cal:
+                days  = ev["days_away"]
+                label = "TODAY" if days == 0 else "TOMORROW" if days == 1 else f"In {days} days"
+                icon  = "🔴" if days <= 1 else "🟡" if days <= 3 else "🟢"
+                with st.expander(f"{icon}  {ev['company']}  ({ev['symbol']})  —  {label}  ·  {ev['result_date']}"):
+                    c1, c2 = st.columns(2)
+                    c1.metric("Nifty weight",    f"{ev['nifty_wt']:.1f}%")
+                    c2.metric("BankNifty weight", f"{ev['bn_wt']:.1f}%" if ev['bn_wt'] > 0 else "N/A")
+                    if st.button(f"Deep analyse {ev['symbol']} ↗", key=f"c_{ev['symbol']}"):
+                        with st.spinner(f"Analysing {ev['company']}…"):
+                            an = analyse_earnings(ev["symbol"], ev["company"])
+                        if an:
+                            st.write(an.get("summary", ""))
+                            x1, x2 = st.columns(2)
+                            x1.success(f"Bull: {an.get('bull_stock','—')}")
+                            x2.error(f"Bear: {an.get('bear_stock','—')}")
+        elif not analyse_btn:
+            st.info("Run a full scan to populate the earnings calendar, "
+                    "or pick a stock from the sidebar for an instant deep analysis.")
 
-    # Overall view badge
-    view = result.get("overall_market_view", "NEUTRAL")
-    color = "#eaf3de" if "BULL" in view else ("#fcebeb" if "BEAR" in view else "#faeeda")
-    st.markdown(
-        f'<div style="background:{color};border-radius:8px;padding:10px 16px;'
-        f'font-weight:500;font-size:15px;margin-bottom:1rem">Market view: {view}</div>',
-        unsafe_allow_html=True,
-    )
+    # ════════════════════════════════════════════════════════════
+    # TAB: LIVE NEWS SIGNALS
+    # ════════════════════════════════════════════════════════════
+    with t_news:
+        signals    = st.session_state.get("signals", [])
+        all_clfd   = st.session_state.get("all_clfd", [])
 
-    # Top news signals
-    signals = result.get("top_signals", [])
-    if signals:
-        st.markdown("**Top signals**")
-        for s in signals:
-            direction_color = "#3b6d11" if s.get("direction") == "RALLY" else (
-                "#a32d2d" if s.get("direction") == "CRASH" else "#854f0b"
-            )
-            with st.expander(
-                f"[{s.get('direction')}] {s.get('headline', '')[:80]}  —  "
-                f"{s.get('confidence', 0)}% confidence"
-            ):
-                st.write(f"**Category:** {s.get('category_label')}")
-                st.write(f"**Nifty impact:** {s.get('nifty_impact')}")
-                st.write(f"**BankNifty:** {s.get('banknifty_impact')}")
-                st.write(f"**Timing:** {s.get('timing')}")
-                st.write(f"**Sectors:** {', '.join(s.get('affected_sectors', []))}")
-                st.write(f"**Reasoning:** {s.get('reasoning')}")
+        if not all_clfd:
+            st.info("Run a full scan to see live news signals.")
+        else:
+            f1, f2, f3 = st.columns(3)
+            dfilter = f1.selectbox("Direction", ["All","CRASH","RALLY","MIXED","NEUTRAL"])
+            mfilter = f2.selectbox("Magnitude", ["All","EXTREME","HIGH","MEDIUM","LOW"])
+            show_all = f3.checkbox("Show non-material news too")
 
-    # Earnings calendar
-    cal = result.get("upcoming_earnings_calendar", [])
-    if cal:
-        st.markdown("**Upcoming earnings (next 3 days)**")
-        df = pd.DataFrame(cal)
-        df.columns = ["Symbol", "Company", "Result date", "Days away"]
-        st.dataframe(df, use_container_width=True, hide_index=True)
+            pool = all_clfd if show_all else signals
+            if dfilter != "All": pool = [s for s in pool if s.get("direction") == dfilter]
+            if mfilter != "All": pool = [s for s in pool if s.get("magnitude") == mfilter]
 
-    # Deep earnings analyses
-    deep = result.get("earnings_today_tomorrow", [])
-    for e in deep:
-        st.markdown(f"**Deep analysis: {e.get('company')} ({e.get('symbol')})**")
-        c1, c2, c3 = st.columns(3)
-        c1.metric("Nifty weight", f"{e.get('nifty_weight', 0):.1f}%")
-        c2.metric("Avg result-day move", f"{e.get('avg_historical_reaction_pct', 0):+.1f}%")
-        c3.metric("Beat/Miss/In-line", e.get("beat_or_miss", "—"))
-        col_a, col_b = st.columns(2)
-        with col_a:
-            st.markdown("**Bull case**")
-            st.success(e.get("bull_case_move", "—"))
-            for pt in e.get("key_positive", []):
-                st.markdown(f"+ {pt}")
-        with col_b:
-            st.markdown("**Bear case**")
-            st.error(e.get("bear_case_move", "—"))
-            for pt in e.get("key_negative", []):
-                st.markdown(f"- {pt}")
-        st.caption(e.get("summary", ""))
+            st.caption(f"Showing {len(pool)} signals")
 
+            for s in pool:
+                pb   = s.get("_pb", {})
+                icon = pb.get("icon", "📌")
+                d    = s.get("direction", "NEUTRAL")
+                conf = s.get("confidence", 0)
+                title = s.get("_title", "")
 
-# ─────────────────────────────────────────────
-# CLI ENTRY POINT
-# ─────────────────────────────────────────────
+                with st.expander(f"{icon}  [{d}]  {title[:85]}  —  {conf}% confidence"):
+                    r1, r2, r3 = st.columns(3)
+                    r1.markdown(f"**Category:** {pb.get('label', s.get('category','—'))}")
+                    r2.markdown(f"**Direction:** {d}  |  {s.get('magnitude','—')}")
+                    r3.markdown(f"**Timing:** {s.get('timing','—')}")
+
+                    r4, r5 = st.columns(2)
+                    r4.markdown(f"**Nifty impact:** {s.get('nifty_impact','—')}")
+                    r5.markdown(f"**BankNifty:** {s.get('bn_multiplier',1.0):.1f}× Nifty move")
+
+                    secs = s.get("sectors", [])
+                    if secs:
+                        st.markdown(f"**Sectors:** {', '.join(secs)}")
+
+                    rel = s.get("related_stock")
+                    if rel:
+                        st.markdown(f"**Related stock:** `{rel}`")
+
+                    st.markdown(f"**Reasoning:** {s.get('reasoning','—')}")
+                    st.markdown(f"**Historical precedent:** {pb.get('examples','—')}")
+
+                    url = s.get("_url","")
+                    if url:
+                        st.markdown(f"[Read full article →]({url})")
+                    st.caption(f"Source: {s.get('_source','')}  ·  {s.get('_published','')}")
+
+                    # Deep-dive button if news is about a specific F&O stock
+                    if rel and rel in FNO:
+                        if st.button(f"Deep analyse {rel} earnings ↗", key=f"n_{_ck(title)}"):
+                            _, co, _, _ = FNO[rel]
+                            with st.spinner(f"Analysing {rel}…"):
+                                an = analyse_earnings(rel, co)
+                            if an:
+                                st.write(an.get("summary",""))
+                                z1, z2 = st.columns(2)
+                                z1.success(f"Bull: {an.get('bull_stock','—')}")
+                                z2.error(f"Bear: {an.get('bear_stock','—')}")
+
+    # ════════════════════════════════════════════════════════════
+    # TAB: MARKET OVERVIEW
+    # ════════════════════════════════════════════════════════════
+    with t_overview:
+        ov       = st.session_state.get("ov")
+        signals  = st.session_state.get("signals", [])
+        cal      = st.session_state.get("cal", [])
+        scanned  = st.session_state.get("scanned", "")
+
+        if not ov:
+            st.info("Click **Run full scan** in the sidebar to start.")
+            st.markdown("""
+**What this app does:**
+- Scans 7 Indian financial news RSS feeds in real time
+- Classifies each headline against the 20-year Nifty playbook (15 categories)
+- Estimates Nifty / BankNifty impact, timing, and affected sectors
+- Tracks earnings calendars for 24 F&O stocks via BSE API
+- Deep-analyses quarterly financials with YoY/QoQ comparison, bull/bear case, and historical result-day reactions
+""")
+        else:
+            st.caption(f"Last scan: {scanned}")
+
+            lbl = ov["label"]
+            getattr(st, ov["color"])(f"### Overall market view: {lbl}  (score: {ov['net']:+.2f})")
+
+            m1, m2, m3, m4 = st.columns(4)
+            m1.metric("Bearish signals",    ov["crash"])
+            m2.metric("Bullish signals",    ov["rally"])
+            m3.metric("Upcoming results",   len(cal))
+            m4.metric("Net signal score",   f"{ov['net']:+.2f}")
+
+            st.divider()
+
+            if signals:
+                st.markdown("**Top signals this scan**")
+                top5 = sorted(signals, key=lambda s: s.get("confidence",0), reverse=True)[:5]
+                for s in top5:
+                    pb   = s.get("_pb", {})
+                    icon = pb.get("icon","📌")
+                    d    = s.get("direction","NEUTRAL")
+                    st.markdown(
+                        f"{icon} {_badge(d)} &nbsp;"
+                        f"**{s.get('_title','')[:90]}**  \n"
+                        f"<small style='color:gray'>"
+                        f"{s.get('_source','')} · "
+                        f"{pb.get('label','')} · "
+                        f"Nifty: {s.get('nifty_impact','?')} · "
+                        f"{s.get('confidence',0)}% confidence"
+                        f"</small>",
+                        unsafe_allow_html=True,
+                    )
+                    st.markdown("")
+
+            urgent = [e for e in cal if e["days_away"] <= 1]
+            if urgent:
+                st.divider()
+                st.markdown("**🔴 Results today / tomorrow — high watch**")
+                for ev in urgent:
+                    label = "TODAY" if ev["days_away"] == 0 else "TOMORROW"
+                    st.warning(
+                        f"**{ev['company']}  ({ev['symbol']})  — {label}**  \n"
+                        f"Nifty weight: {ev['nifty_wt']:.1f}%  |  "
+                        f"BankNifty weight: {ev['bn_wt']:.1f}%  \n"
+                        f"Go to the **Earnings calendar** tab for deep analysis."
+                    )
+
+    # ════════════════════════════════════════════════════════════
+    # FULL SCAN EXECUTION
+    # ════════════════════════════════════════════════════════════
+    if run_btn:
+        if not get_api_key():
+            st.error("Add ANTHROPIC_API_KEY to Streamlit Secrets first.")
+            st.stop()
+
+        prog = st.progress(0, text="Fetching news feeds…")
+
+        # Step 1 — Fetch news
+        all_news = fetch_news(max_per_feed=news_count // len(NEWS_FEEDS) + 1)
+        all_news = all_news[:news_count]
+        prog.progress(15, text=f"Fetched {len(all_news)} headlines. Classifying…")
+
+        # Step 2 — Classify
+        all_clfd = []
+        for i, item in enumerate(all_news):
+            clf = classify_one(item)
+            clf["_title"]     = item["title"]
+            clf["_source"]    = item["source"]
+            clf["_url"]       = item["url"]
+            clf["_published"] = item["published"]
+            clf["_pb"]        = PLAYBOOK.get(clf.get("category","uncategorised"),
+                                             PLAYBOOK["uncategorised"])
+            all_clfd.append(clf)
+            prog.progress(15 + int(55 * i / max(len(all_news),1)),
+                          text=f"Classifying {i+1}/{len(all_news)}…")
+
+        signals = [c for c in all_clfd
+                   if c.get("is_material") and c.get("confidence",0) >= min_conf]
+
+        # Step 3 — Earnings calendar
+        prog.progress(75, text="Fetching earnings calendar from BSE…")
+        cal = earnings_calendar(days_ahead=earn_days)
+
+        # Step 4 — Overall view
+        ov = overall_view(signals)
+
+        st.session_state.update({
+            "all_clfd": all_clfd,
+            "signals":  signals,
+            "cal":      cal,
+            "ov":       ov,
+            "scanned":  datetime.now().strftime("%d %b %Y  %H:%M IST"),
+        })
+
+        prog.progress(100, text="Done.")
+        time.sleep(0.4)
+        prog.empty()
+        st.rerun()
+
 
 if __name__ == "__main__":
-    import argparse, pprint
-
-    parser = argparse.ArgumentParser(description="System 1818 News & Earnings Bot")
-    parser.add_argument("--mode", choices=["full", "news", "stock"], default="full")
-    parser.add_argument("--stock", type=str, default="HDFCBANK", help="NSE symbol for --mode=stock")
-    args = parser.parse_args()
-
-    bot = NewsEarningsBot()
-
-    if args.mode == "full":
-        result = bot.run_full_scan()
-        print("\n=== MARKET VIEW ===")
-        print(f"Overall: {result['overall_market_view']}")
-        print(f"Net signal score: {result['net_signal_score']}")
-        print(f"\nTop signals: {len(result['top_signals'])}")
-        for s in result["top_signals"][:3]:
-            print(f"  [{s['direction']}] {s['headline'][:70]}")
-            print(f"    Category: {s['category_label']} | Impact: {s['nifty_impact']}")
-
-    elif args.mode == "news":
-        signals = bot.run_news_only()
-        print(f"\n{len(signals)} material signals found:")
-        for s in signals:
-            print(f"  [{s['direction']}] {s['headline'][:70]}")
-
-    elif args.mode == "stock":
-        analysis = bot.analyse_single_stock_earnings(args.stock.upper())
-        pprint.pprint(analysis)
+    main()
