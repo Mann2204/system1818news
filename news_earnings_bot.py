@@ -12,7 +12,8 @@ Folder structure required:
 """
 
 import os, json, time, hashlib, logging
-import requests, feedparser, anthropic
+import requests, feedparser
+import google.generativeai as genai
 import pandas as pd
 import streamlit as st
 from datetime import datetime, date
@@ -36,9 +37,9 @@ log = logging.getLogger(__name__)
 
 def get_api_key() -> str:
     try:
-        return st.secrets["ANTHROPIC_API_KEY"]
+        return st.secrets["GEMINI_API_KEY"]
     except Exception:
-        return os.getenv("ANTHROPIC_API_KEY", "")
+        return os.getenv("GEMINI_API_KEY", "")
 
 # ─────────────────────────────────────────────────────────────────
 # CACHE  (uses /tmp — works on Streamlit Cloud)
@@ -70,10 +71,11 @@ def _wcache(key: str, data):
         pass
 
 # ─────────────────────────────────────────────────────────────────
-# CLAUDE API HELPER
+# GEMINI API HELPER
 # ─────────────────────────────────────────────────────────────────
 
 def _claude(system: str, user: str, max_tokens: int = 800, ttl: int = 60) -> str:
+    """Calls Gemini Flash (free tier). Same interface as the old Claude helper."""
     ck = _ck(system[:80] + user[:200])
     cached = _rcache(ck, ttl_min=ttl)
     if cached:
@@ -82,14 +84,13 @@ def _claude(system: str, user: str, max_tokens: int = 800, ttl: int = 60) -> str
     if not key:
         return '{"error":"No API key configured"}'
     try:
-        client = anthropic.Anthropic(api_key=key)
-        msg = client.messages.create(
-            model="claude-sonnet-4-6",
-            max_tokens=max_tokens,
-            system=system,
-            messages=[{"role": "user", "content": user}],
+        genai.configure(api_key=key)
+        model = genai.GenerativeModel(
+            model_name="gemini-2.0-flash",
+            system_instruction=system,
         )
-        text = msg.content[0].text
+        response = model.generate_content(user)
+        text = response.text
         _wcache(ck, {"t": text})
         return text
     except Exception as e:
@@ -627,7 +628,7 @@ def main():
         run_btn = st.button("Run full scan ↗", type="primary", use_container_width=True)
 
         if not get_api_key():
-            st.error("ANTHROPIC_API_KEY not found.\nAdd it in Streamlit → Settings → Secrets.")
+            st.error("GEMINI_API_KEY not found.\nAdd it in Streamlit → Settings → Secrets.")
 
     # ── TABS ─────────────────────────────────────────────────────
     t_overview, t_news, t_earnings, t_playbook = st.tabs([
@@ -876,7 +877,7 @@ def main():
     # ════════════════════════════════════════════════════════════
     if run_btn:
         if not get_api_key():
-            st.error("Add ANTHROPIC_API_KEY to Streamlit Secrets first.")
+            st.error("Add GEMINI_API_KEY to Streamlit Secrets first.")
             st.stop()
 
         prog = st.progress(0, text="Fetching news feeds…")
